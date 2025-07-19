@@ -1,0 +1,343 @@
+---
+title: "Seminar Applied Statistics - HTS Forecasting"
+author: "Your Name"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Import data
+
+```{r}
+rm(list = ls())
+
+library("readxl")
+library("openxlsx")
+library("forecast")
+library("hts")
+```
+
+```{r}
+dat <- read_excel("cleaned.xlsx")
+
+hor <- 8 # horizon of planning
+
+# Interpret each as a time-series object
+tsnames <- colnames(dat)[3:20] # list of names of product-locations
+```
+
+### Base forecasting models
+
+```{r}
+
+for (i in 1:18) {
+  a <- assign(tsnames[i], as.ts(dat[i + 2] + 0.00001, start = 1, end = 50, frequency = 1))
+  est <- window(a, start = 1, end = 50 - hor)
+  checkresiduals(assign(paste("bm_", tsnames[i], sep = ""),
+                        auto.arima(est, ic = "aic", lambda = 0, allowdrift = FALSE)))
+}
+
+checkresiduals(bm_M300451) # Example model check
+```
+
+### Hierarchical time-series objects
+
+```{r}
+sku <- rep(c("200738", "201810", "300451", "300522", "300709"), each = 2)
+retailer <- rep(c("M", "S"), 5)
+
+# Group time-series object
+groupts <- gts(dat[3:12], groups = rbind(sku, retailer)) 
+
+# Plot different groupings
+groupts %>% aggts(level = c(0, 1)) %>% autoplot()
+groupts %>% aggts(level = c(0, 2)) %>% autoplot()
+groupts %>% aggts(level = 3) %>% autoplot()
+```
+
+### Create HTS structures
+
+```{r}
+hierRetSku <- hts(dat[3:12] + 0.00001, nodes = list(2, c(5, 5)), characters = c(1,6))
+plot.gts(hierRetSku)
+
+hierSkuRet <- hts(dat[3:12] + 0.00001, nodes = list(5, rep(2, 5)))
+hierSkuRet$labels$`Level 1` <- c("200738", "201810", "300451", "300522", "300709")
+plot.gts(hierSkuRet)
+```
+
+### Split into training and test sets
+
+```{r}
+hierRetSku_est <- window(hierRetSku, start = 1, end = 50 - hor)
+hierRetSku_test <- window(hierRetSku, start = 50 - hor + 1, end = 50)
+
+hierSkuRet_est <- window(hierSkuRet, start = 1, end = 50 - hor)
+hierSkuRet_test <- window(hierSkuRet, start = 50 - hor + 1, end = 50)
+```
+
+```{r}
+###Aggregation approaches
+
+###Out-of-sample RMSE is calculated
+
+#Empty data-frame for saving RMSEs and MAPEs: hierarchy RS
+
+RMSE_RS <- as.data.frame(matrix(NA, nrow = 10, ncol = 15))
+colnames(RMSE_RS) <- c("Hierarchy", "Method", "Total", "M", "S", "M200738", "M201810", "M300451", "M300522",
+                    "M300709", "S200738", "S201810", "S300451", "S300522", "S300709")
+RMSE_RS[, 1] <- rep("RS", 10)
+
+MAPE_RS <- as.data.frame(matrix(NA, nrow = 10, ncol = 15))
+colnames(MAPE_RS) <- c("Hierarchy", "Method", "Total", "M", "S", "M200738", "M201810", "M300451", "M300522",
+                       "M300709", "S200738", "S201810", "S300451", "S300522", "S300709")
+MAPE_RS[, 1] <- rep("RS", 10)
+
+#Empty data-frame for saving RMSEs and MAPEs: hierarchy SR
+
+RMSE_SR <- as.data.frame(matrix(NA, nrow = 10, ncol = 18))
+colnames(RMSE_SR) <- c("Hierarchy", "Method", "Total", "200738", "201810", "300451",
+                       "300522", "300709", "M200738", "S200738", "M300451", "S300451",
+                       "M300522", "S300522", "M201810", "S201810", "M300709", "S300709")
+RMSE_SR[, 1] <- rep("SR", 10)
+
+MAPE_SR <- as.data.frame(matrix(NA, nrow = 10, ncol = 18))
+colnames(MAPE_SR) <- c("Hierarchy", "Method", "Total", "200738", "201810", "300451",
+                       "300522", "300709", "M200738", "S200738", "M300451", "S300451",
+                       "M300522", "S300522", "M201810", "S201810", "M300709", "S300709")
+MAPE_SR[, 1] <- rep("SR", 10)
+
+
+
+# 1) Bottom-up approach (bu)
+
+#Grouped ts is not used here for convenience, the results are the same
+
+buRS <- forecast.gts(hierRetSku_est, method = "bu", fmethod = "arima", h = hor,
+                      ic = "aic", lambda = 0, allowdrift = FALSE)
+
+RMSE_RS[1, 3:15] <- accuracy.gts(buRS, hierRetSku_test)["RMSE", ] #for hierarchy 1
+RMSE_RS[1, 2] <- "bu"
+MAPE_RS[1, 3:15] <- accuracy.gts(buRS, hierRetSku_test)["MAPE", ] #for hierarchy 1
+MAPE_RS[1, 2] <- "bu"
+plot(buRS)
+
+
+buSR <- forecast.gts(hierSkuRet_est, method = "bu", fmethod = "arima", h = hor,
+                      ic = "aic", lambda = 0, allowdrift = FALSE)
+RMSE_SR[1, 3:18] <- accuracy.gts(buSR, hierSkuRet_test)["RMSE", ] #for hierarchy 2
+RMSE_SR[1, 2] <- "bu"
+MAPE_SR[1, 3:18] <- accuracy.gts(buSR, hierSkuRet_test)["MAPE", ] #for hierarchy 2
+MAPE_SR[1, 2] <- "bu"
+plot(buSR)
+
+# 2) Top-down approach: Average historical proportions (tdgsa)
+
+tdgsaRS <- forecast.gts(hierRetSku_est, method = "tdgsa", fmethod = "arima", h = hor,
+                      ic = "aic", lambda = 0, allowdrift = FALSE)
+RMSE_RS[2, 3:15] <- accuracy.gts(tdgsaRS, hierRetSku_test)["RMSE", ] #for hierarchy 1
+RMSE_RS[2, 2] <- "tdgsa"
+MAPE_RS[2, 3:15] <- accuracy.gts(tdgsaRS, hierRetSku_test)["MAPE", ] #for hierarchy 1
+MAPE_RS[2, 2] <- "tdgsa"
+plot(tdgsaRS)
+
+
+tdgsaSR <- forecast.gts(hierSkuRet_est, method = "tdgsa", fmethod = "arima", h = hor,
+                      ic = "aic", lambda = 0, allowdrift = FALSE)
+RMSE_SR[2, 3:18] <- accuracy.gts(tdgsaSR, hierSkuRet_test)["RMSE", ] #for hierarchy 2
+RMSE_SR[2, 2] <- "tdgsa"
+MAPE_SR[2, 3:18] <- accuracy.gts(tdgsaSR, hierSkuRet_test)["MAPE", ] #for hierarchy 2
+MAPE_SR[2, 2] <- "tdgsa"
+plot(tdgsaSR)
+
+
+# 3) Top-down approach: Proportions of the historical averages (tdgsf)
+
+tdgsfRS <- forecast.gts(hierRetSku_est, method = "tdgsf", fmethod = "arima", h = hor,
+                      lambda = 0, ic = "aic", allowdrift = FALSE)
+RMSE_RS[3, 3:15] <- accuracy.gts(tdgsfRS, hierRetSku_test)["RMSE", ] #for hierarchy 1
+RMSE_RS[3, 2] <- "tdgsf"
+MAPE_RS[3, 3:15] <- accuracy.gts(tdgsfRS, hierRetSku_test)["MAPE", ] #for hierarchy 1
+MAPE_RS[3, 2] <- "tdgsf"
+plot(tdgsfRS)
+
+
+tdgsfSR <- forecast.gts(hierSkuRet_est, method = "tdgsf", fmethod = "arima", h = hor,
+                      lambda = 0, ic = "aic", allowdrift = FALSE)
+RMSE_SR[3, 3:18] <- accuracy.gts(tdgsfSR, hierSkuRet_test)["RMSE", ] #for hierarchy 2
+RMSE_SR[3, 2] <- "tdgsf"
+MAPE_SR[3, 3:18] <- accuracy.gts(tdgsfSR, hierSkuRet_test)["MAPE", ] #for hierarchy 2
+MAPE_SR[3, 2] <- "tdgsf"
+plot(tdgsfSR)
+
+
+# 4) Top-down approach: Forecast proportions (tdfp)
+
+tdfpRS <- forecast.gts(hierRetSku_est, method = "tdfp", fmethod = "arima", h = hor,
+                      lambda = 0, ic = "aic", allowdrift = FALSE)
+RMSE_RS[4, 3:15] <- accuracy.gts(tdfpRS, hierRetSku_test)["RMSE", ] #for hierarchy 1
+RMSE_RS[4, 2] <- "tdfp"
+MAPE_RS[4, 3:15] <- accuracy.gts(tdfpRS, hierRetSku_test)["MAPE", ] #for hierarchy 1
+MAPE_RS[4, 2] <- "tdfp"
+plot(tdfpRS)
+
+
+tdfpSR <- forecast.gts(hierSkuRet_est, method = "tdfp", fmethod = "arima", h = hor,
+                      lambda = 0, ic = "aic", allowdrift = FALSE)
+RMSE_SR[4, 3:18] <- accuracy.gts(tdfpSR, hierSkuRet_test)["RMSE", ] #for hierarchy 2
+RMSE_SR[4, 2] <- "tdfp"
+MAPE_SR[4, 3:18] <- accuracy.gts(tdfpSR, hierSkuRet_test)["MAPE", ] #for hierarchy 2
+MAPE_SR[4, 2] <- "tdfp"
+plot(tdfpSR)
+
+
+# 5) Middle-out approach
+
+moRS <- forecast.gts(hierRetSku_est, method = "mo", level = 1, fmethod = "arima", h = hor,
+                      lambda = 0, ic = "aic", allowdrift = FALSE)
+RMSE_RS[5, 3:15] <- accuracy.gts(moRS, hierRetSku_test)["RMSE", ] #for hierarchy 1
+RMSE_RS[5, 2] <- "mo"
+MAPE_RS[5, 3:15] <- accuracy.gts(moRS, hierRetSku_test)["MAPE", ] #for hierarchy 1
+MAPE_RS[5, 2] <- "mo"
+plot(moRS)
+
+
+moSR <- forecast.gts(hierSkuRet_est, method = "mo", level = 1, fmethod = "arima", h = hor,
+                      lambda = 0, ic = "aic", allowdrift = FALSE)
+RMSE_SR[5, 3:18] <- accuracy.gts(moSR, hierSkuRet_test)["RMSE", ] #for hierarchy 2
+RMSE_SR[5, 2] <- "mo"
+MAPE_SR[5, 3:18] <- accuracy.gts(moSR, hierSkuRet_test)["MAPE", ] #for hierarchy 2
+MAPE_SR[5, 2] <- "mo"
+plot(moSR)
+
+
+# 6) Optimal reconciliation approach (comb):
+# OLS estimator (ols)
+
+combolsRS <- forecast.gts(hierRetSku_est, method = "comb", weights = "ols", fmethod = "arima",
+    h = hor, lambda = 0, ic = "aic", allowdrift = FALSE)
+RMSE_RS[6, 3:15] <- accuracy.gts(combolsRS, hierRetSku_test)["RMSE", ] #for hierarchy 1
+RMSE_RS[6, 2] <- "comb-ols"
+MAPE_RS[6, 3:15] <- accuracy.gts(combolsRS, hierRetSku_test)["MAPE", ] #for hierarchy 1
+MAPE_RS[6, 2] <- "comb-ols"
+plot(combolsRS)
+
+
+combolsSR <- forecast.gts(hierSkuRet_est, method = "comb", weights = "ols", fmethod = "arima",
+  h = hor, lambda = 0, ic = "aic", allowdrift = FALSE)
+RMSE_SR[6, 3:18] <- accuracy.gts(combolsSR, hierSkuRet_test)["RMSE", ] #for hierarchy 2
+RMSE_SR[6, 2] <- "comb-ols"
+MAPE_SR[6, 3:18] <- accuracy.gts(combolsSR, hierSkuRet_test)["MAPE", ] #for hierarchy 2
+MAPE_SR[6, 2] <- "comb-ols"
+plot(combolsSR)
+
+
+# 7) Optimal reconciliation approach (comb):
+# WLS estimator (wls)
+
+combwlsRS <- forecast.gts(hierRetSku_est, method = "comb", weights = "wls", fmethod = "arima",
+  h = hor, lambda = 0, ic = "aic", allowdrift = FALSE)
+RMSE_RS[7, 3:15] <- accuracy.gts(combwlsRS, hierRetSku_test)["RMSE", ] #for hierarchy 1
+RMSE_RS[7, 2] <- "comb-wls"
+MAPE_RS[7, 3:15] <- accuracy.gts(combwlsRS, hierRetSku_test)["MAPE", ] #for hierarchy 1
+MAPE_RS[7, 2] <- "comb-wls"
+plot(combwlsRS)
+
+
+combwlsSR <- forecast.gts(hierSkuRet_est, method = "comb", weights = "wls", fmethod = "arima",
+  h = hor, lambda = 0, ic = "aic", allowdrift = FALSE)
+RMSE_SR[7, 3:18] <- accuracy.gts(combwlsSR, hierSkuRet_test)["RMSE", ] #for hierarchy 2
+RMSE_SR[7, 2] <- "comb-wls"
+MAPE_SR[7, 3:18] <- accuracy.gts(combwlsSR, hierSkuRet_test)["MAPE", ] #for hierarchy 2
+MAPE_SR[7, 2] <- "comb-wls"
+plot(combwlsSR)
+
+
+# 8) Optimal reconciliation approach (comb):
+# WLS estimator using structural scaling (nseries)
+
+combnseriesRS <- forecast.gts(hierRetSku_est, method = "comb", weights = "nseries",
+  fmethod = "arima", h = hor, lambda = 0, ic = "aic", allowdrift = FALSE)
+RMSE_RS[8, 3:15] <- accuracy.gts(combnseriesRS, hierRetSku_test)["RMSE", ] #for hierarchy 1
+RMSE_RS[8, 2] <- "comb-nseries"
+MAPE_RS[8, 3:15] <- accuracy.gts(combnseriesRS, hierRetSku_test)["MAPE", ] #for hierarchy 1
+MAPE_RS[8, 2] <- "comb-nseries"
+plot(combnseriesRS)
+
+
+combnseriesSR <- forecast.gts(hierSkuRet_est, method = "comb", weights = "nseries", 
+  fmethod = "arima", h = hor, lambda = 0, ic = "aic", allowdrift = FALSE)
+RMSE_SR[8, 3:18] <- accuracy.gts(combnseriesSR, hierSkuRet_test)["RMSE", ] #for hierarchy 2
+RMSE_SR[8, 2] <- "comb-nseries"
+MAPE_SR[8, 3:18] <- accuracy.gts(combnseriesSR, hierSkuRet_test)["MAPE", ] #for hierarchy 2
+MAPE_SR[8, 2] <- "comb-nseries"
+plot(combnseriesSR)
+
+
+# 9) Optimal reconciliation approach (comb):
+# Minimal trace (sample estimate of the residual covariance matrix)
+
+combmintsamRS <- forecast.gts(hierRetSku_est, method = "comb", weights = "mint",
+    covariance = "sam", fmethod = "arima", h = hor, lambda = 0, ic = "aic", allowdrift = FALSE)
+RMSE_RS[9, 3:15] <- accuracy.gts(combmintsamRS, hierRetSku_test)["RMSE", ] #for hierarchy 1
+RMSE_RS[9, 2] <- "comb-mint-sam"
+MAPE_RS[9, 3:15] <- accuracy.gts(combmintsamRS, hierRetSku_test)["MAPE", ] #for hierarchy 1
+MAPE_RS[9, 2] <- "comb-mint-sam"
+plot(combmintsamRS)
+
+
+combmintsamSR <- forecast.gts(hierSkuRet_est, method = "comb", weights = "mint",
+    covariance = "sam", fmethod = "arima", h = hor, lambda = 0, ic = "aic", allowdrift = FALSE)
+RMSE_SR[9, 3:18] <- accuracy.gts(combmintsamSR, hierSkuRet_test)["RMSE", ] #for hierarchy 2
+RMSE_SR[9, 2] <- "comb-mint-sam"
+MAPE_SR[9, 3:18] <- accuracy.gts(combmintsamSR, hierSkuRet_test)["MAPE", ] #for hierarchy 2
+MAPE_SR[9, 2] <- "comb-mint-sam"
+plot(combmintsamRS)
+
+
+# 10) Optimal reconciliation approach (comb):
+# Minimal trace (shrinkage estimate of the residual covariance matrix)
+
+combmintshrRS <- forecast.gts(hierRetSku_est, method = "comb", weights = "mint",
+    covariance = "shr", fmethod = "arima", h = hor, lambda = 0, ic = "aic", allowdrift = FALSE)
+RMSE_RS[10, 3:15] <- accuracy.gts(combmintshrRS, hierRetSku_test)["RMSE", ] #for hierarchy 1
+RMSE_RS[10, 2] <- "comb-mint-shr"
+MAPE_RS[10, 3:15] <- accuracy.gts(combmintshrRS, hierRetSku_test)["MAPE", ] #for hierarchy 1
+MAPE_RS[10, 2] <- "comb-mint-shr"
+plot(combmintshrRS)
+
+
+combmintshrSR <- forecast.gts(hierSkuRet_est, method = "comb", weights = "mint",
+    covariance = "shr", fmethod = "arima", h = hor, lambda = 0, ic = "aic", allowdrift = FALSE)
+RMSE_SR[10, 3:18] <- accuracy.gts(combmintshrSR, hierSkuRet_test)["RMSE", ] #for hierarchy 2
+RMSE_SR[10, 2] <- "comb-mint-shr"
+MAPE_SR[10, 3:18] <- accuracy.gts(combmintshrSR, hierSkuRet_test)["MAPE", ] #for hierarchy 2
+MAPE_SR[10, 2] <- "comb-mint-shr"
+plot(combmintshrSR)
+```
+
+```{r}
+###Results and model selection
+
+RMSE_RS
+RMSE_SR
+MAPE_RS
+MAPE_SR
+```
+
+```{r}
+#Export errors in Excel
+
+
+
+write.xlsx(list(RMSE_RS, RMSE_SR, MAPE_RS, MAPE_SR),
+           "errors.xlsx",
+           colNames = TRUE, rowNames = TRUE, sheetName = c("RMSE_RS", "RMSE_SR", "MAPE_RS", "MAPE_SR"))
+
+```
+
+
